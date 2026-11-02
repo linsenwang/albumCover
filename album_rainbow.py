@@ -2,6 +2,7 @@ import argparse
 import colorsys
 import os
 
+import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
@@ -16,7 +17,9 @@ MAX_SCALE = 0.22
 COVER_GAP = 10
 MARGIN = 20
 LAYOUT_ITERATIONS = 600
-DEDUPE_DISTANCE = 2
+DEDUPE_INLIERS = 60
+ORB = cv2.ORB_create(nfeatures=300)
+MATCHER = cv2.BFMatcher(cv2.NORM_HAMMING)
 
 
 def get_images_from_folder(folder_path):
@@ -43,23 +46,57 @@ def get_brightness_and_hue_for_images(images):
     return [get_brightness_and_hue(path) for path in images]
 
 
-def difference_hash(image_path, size=16):
-    gray = ImageOps.grayscale(Image.open(image_path))
-    gray = gray.resize((size + 1, size), Image.LANCZOS)
-    pixels = np.asarray(gray, dtype=np.int16)
-    return (pixels[:, 1:] > pixels[:, :-1]).flatten()
+def get_cover_features(image_path):
+    """提取用于重复封面检测的 ORB 特征。"""
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0, 32), dtype=np.uint8)
+
+    scale = 256 / max(image.shape)
+    if scale < 1:
+        image = cv2.resize(image, None, fx=scale, fy=scale)
+
+    keypoints, descriptors = ORB.detectAndCompute(image, None)
+    points = np.float32([keypoint.pt for keypoint in keypoints])
+    if descriptors is None:
+        descriptors = np.zeros((0, 32), dtype=np.uint8)
+    return points, descriptors
 
 
-def dedupe_images(images, max_distance=DEDUPE_DISTANCE):
-    """去掉封面完全相同的重复专辑（同一张图的不同版本/语言标签）。"""
-    kept, hashes = [], []
+def is_same_cover(features_a, features_b, min_inliers=DEDUPE_INLIERS):
+    """同一封面即使被裁切、缩放，也能通过单应性内点数量判定。"""
+    points_a, descriptors_a = features_a
+    points_b, descriptors_b = features_b
+    if len(descriptors_a) < 2 or len(descriptors_b) < 2:
+        return False
+
+    matches = MATCHER.knnMatch(descriptors_a, descriptors_b, k=2)
+    good = [
+        pair[0] for pair in matches
+        if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance
+    ]
+    if len(good) < 4:
+        return False
+
+    src = np.float32([points_a[m.queryIdx] for m in good]).reshape(-1, 1, 2)
+    dst = np.float32([points_b[m.trainIdx] for m in good]).reshape(-1, 1, 2)
+    try:
+        _, mask = cv2.findHomography(src, dst, cv2.RANSAC, 5.0)
+    except cv2.error:
+        return False
+    return mask is not None and int(mask.sum()) >= min_inliers
+
+
+def dedupe_images(images, min_inliers=DEDUPE_INLIERS):
+    """去掉同一封面被不同专辑、版本或语言标签重复收录的情况。"""
+    kept, features = [], []
     for path in images:
-        digest = difference_hash(path)
-        if any(np.count_nonzero(digest != other) <= max_distance
-               for other in hashes):
+        digest = get_cover_features(path)
+        if any(is_same_cover(digest, other, min_inliers)
+               for other in features):
             continue
         kept.append(path)
-        hashes.append(digest)
+        features.append(digest)
     return kept
 
 
